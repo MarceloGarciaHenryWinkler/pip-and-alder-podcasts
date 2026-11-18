@@ -1,0 +1,90 @@
+# Adds one episode to a Pip & Alder podcast feed on GitHub Pages and prunes old ones.
+# Run from anywhere after the repo is attached with push access:
+#   python3 publish_feed.py --show wow-forever|off-world --mp3 FILE --title "..." --date YYYY-MM-DD --notes NOTES.html [--type full|bonus] [--season N --episode N] [--keep N] [--keep-weekly N]
+# notes html: the episode's <ul>...</ul><p class="src">...</p> show notes.
+import argparse, json, os, subprocess, shutil, sys, random, time
+p=argparse.ArgumentParser()
+for a in ['--show','--mp3','--title','--date','--notes']: p.add_argument(a,required=True)
+p.add_argument('--type',default='full'); p.add_argument('--season',type=int); p.add_argument('--episode',type=int)
+p.add_argument('--audio-repo',default=''); p.add_argument('--keep',type=int,default=14); p.add_argument('--keep-weekly',type=int,default=4)
+a=p.parse_args()
+URL='https://github.com/MarceloGarciaHenryWinkler/pip-and-alder-podcasts'; SITE='https://marcelogarciahenrywinkler.github.io/pip-and-alder-podcasts'
+D='/home/claude/feedrepo'
+def sh(*c,**k): return subprocess.run(c,check=True,cwd=k.get('cwd',D),capture_output=True,text=True).stdout.strip()
+
+def push_audio(repo,show,mp3):
+    """Host the mp3 in a second repo's GitHub Pages (site branch, single amended commit). Returns public URL."""
+    AD='/home/claude/audiorepo-'+repo; u=f'https://github.com/MarceloGarciaHenryWinkler/{repo}'
+    for attempt in range(12):
+        shutil.rmtree(AD,ignore_errors=True)
+        r=subprocess.run(['git','clone','-q','--depth','1','--filter=blob:limit=2m','--no-checkout','-b','main',u,AD],capture_output=True,text=True)
+        fresh=r.returncode!=0
+        if fresh:
+            subprocess.run(['git','clone','-q','--depth','1',u,AD],check=True)
+            subprocess.run(['git','checkout','-q','--orphan','main'],cwd=AD,check=True)
+            subprocess.run(['git','rm','-rqf','--cached','.'],cwd=AD)
+            for f in os.listdir(AD):
+                if f!='.git': (shutil.rmtree if os.path.isdir(f'{AD}/{f}') else os.remove)(f'{AD}/{f}')
+            open(f'{AD}/.nojekyll','w').close(); open(f'{AD}/index.html','w').write('<!doctype html><title>Pip &amp; Alder audio</title><p>Audio storage for the Pip &amp; Alder podcast feeds.')
+            subprocess.run(['git','add','.nojekyll','index.html'],cwd=AD,check=True); base=None
+        else:
+            subprocess.run(['git','sparse-checkout','set','--no-cone','/*','!*.mp3'],cwd=AD,check=True)
+            subprocess.run(['git','checkout','-q','main'],cwd=AD,check=True)
+            base=subprocess.run(['git','rev-parse','HEAD'],cwd=AD,capture_output=True,text=True).stdout.strip()
+        os.makedirs(f'{AD}/{show}',exist_ok=True); shutil.copy(mp3,f'{AD}/{show}/'+os.path.basename(mp3))
+        subprocess.run(['git','add','--sparse',f'{show}/'+os.path.basename(mp3)],cwd=AD,check=True)
+        c=['git','-c','user.name=Claude','-c','user.email=noreply@anthropic.com','commit','-q']+([] if fresh else ['--amend'])+['-m','Podcast audio']
+        subprocess.run(c,cwd=AD,check=True)
+        lease=[] if fresh else [f'--force-with-lease=main:{base}']
+        r=subprocess.run(['git','-c','push.negotiate=true','push','-f']+lease+['origin','main'],cwd=AD,capture_output=True,text=True)
+        if r.returncode==0 and 'rejected' not in r.stderr:
+            return f'https://marcelogarciahenrywinkler.github.io/{repo}/{show}/'+os.path.basename(mp3)
+        print('audio push rejected; retrying',r.stderr[-200:]); time.sleep(random.uniform(5,20))
+    raise SystemExit('audio push failed')
+
+def go():
+    shutil.rmtree(D,ignore_errors=True)
+    subprocess.run(['git','clone','-q','--depth','1','--filter=blob:limit=2m','--no-checkout','-b','site',URL,D],check=True)
+    sh('git','sparse-checkout','set','--no-cone','/*','!*.mp3'); sh('git','checkout','-q','site')
+    base=sh('git','rev-parse','HEAD')
+    name=os.path.basename(a.mp3)
+    if a.audio_repo: url=AUDIO_URL
+    else:
+        url=f'{SITE}/{a.show}/{name}'; shutil.copy(a.mp3,f'{D}/{a.show}/{name}')
+    sec=float(subprocess.run(['ffprobe','-v','error','-show_entries','format=duration','-of','csv=p=0',a.mp3],capture_output=True,text=True).stdout)
+    E=json.load(open(f'{D}/{a.show}/episodes.json'))
+    E=[e for e in E if e['guid']!=name[:-4]]
+    shutil.copy('/home/claude/feeds/feed.py',f'{D}/feed.py.txt') if os.path.exists('/home/claude/feeds/feed.py') else None
+    if os.path.exists('/home/claude/feeds/feed.py'):
+        shutil.copy('/home/claude/feeds/publish_feed.py',f'{D}/publish_feed.py.txt'); sh('git','add','--sparse','feed.py.txt','publish_feed.py.txt')
+    e=dict(guid=name[:-4],title=a.title,date=a.date,url=url,bytes=os.path.getsize(a.mp3),seconds=round(sec),summary_html=open(a.notes).read(),type=a.type)
+    if a.season: e['season']=a.season
+    if a.episode: e['episode']=a.episode
+    E.append(e)
+    # prune: bonus episodes are permanent; weekly (guid contains 'weekly') keep N; others keep N
+    E.sort(key=lambda x:x['date'],reverse=True)
+    keep=[]; daily=weekly=0; drop=[]
+    for x in E:
+        if x.get('type') in ('bonus','trailer'): keep.append(x); continue
+        if 'weekly' in x['guid']:
+            weekly+=1; (keep if weekly<=a.keep_weekly else drop).append(x)
+        else:
+            daily+=1; (keep if daily<=a.keep else drop).append(x)
+    json.dump(keep,open(f'{D}/{a.show}/episodes.json','w'),indent=1)
+    sh('git','add','--sparse',f'{a.show}/episodes.json')
+    if not a.audio_repo: sh('git','add','--sparse',f'{a.show}/{name}')
+    for x in drop:
+        if 'pip-and-alder-podcasts/' not in x['url']: continue
+        f=f"{a.show}/{x['url'].rsplit('/',1)[1]}"
+        subprocess.run(['git','rm','-q','--sparse','--cached','--ignore-unmatch',f],cwd=D)
+    subprocess.run(['python3','feed.py.txt',a.show,SITE],cwd=D,check=True)
+    sh('git','add','--sparse',f'{a.show}/feed.xml')
+    sh('git','-c','user.name=Claude','-c','user.email=noreply@anthropic.com','commit','-q','--amend','-m','Podcast feeds')
+    r=subprocess.run(['git','-c','push.negotiate=true','push','-f',f'--force-with-lease=site:{base}','origin','site'],cwd=D,capture_output=True,text=True)
+    print(r.stderr[-400:])
+    return r.returncode==0 and 'rejected' not in r.stderr
+AUDIO_URL=push_audio(a.audio_repo,a.show,a.mp3) if a.audio_repo else None
+for attempt in range(12):
+    if go(): print('published', f'{SITE}/{a.show}/feed.xml'); sys.exit(0)
+    print('push rejected (another publish landed first); retrying'); time.sleep(random.uniform(5,25))
+sys.exit(1)
