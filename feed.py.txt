@@ -1,0 +1,28 @@
+# Builds an Apple Podcasts-compatible RSS feed from episodes.json.
+# usage: python3 feed.py SHOW_DIR SITE_URL     (SHOW_DIR has show.json + episodes.json; writes SHOW_DIR/feed.xml)
+# episodes.json: [{"guid","title","date":"YYYY-MM-DD","url","bytes","seconds","summary_html","type":"full|bonus","season":opt,"episode":opt}]
+import json, sys, email.utils, datetime, html
+d=sys.argv[1]; site=sys.argv[2].rstrip('/')
+S=json.load(open(f'{d}/show.json')); E=json.load(open(f'{d}/episodes.json'))
+def x(s): return html.escape(s, quote=True)
+def rfc(day,e=None):
+    d=datetime.datetime.fromisoformat(day+'T07:00:00-07:00')
+    if e and 'episode' in e: d=d.replace(hour=5)+datetime.timedelta(minutes=e.get('season',0)*20+e['episode'])
+    return email.utils.format_datetime(d)
+def dur(s): s=int(s); return f'{s//3600:02d}:{s%3600//60:02d}:{s%60:02d}'
+owner=f'<itunes:owner><itunes:name>Alder &amp; Pip</itunes:name><itunes:email>{x(S["owner_email"])}</itunes:email></itunes:owner>' if S.get('owner_email') else ''
+items=[]
+for e in sorted(E,key=lambda e:(e['date'],0 if 'episode' not in e else -1000+e.get('season',0)*20+e['episode']),reverse=True):
+    extra=''.join(f'<itunes:{k}>{e[k]}</itunes:{k}>' for k in ('season','episode') if k in e)
+    items.append(f'''<item><title>{x(e["title"])}</title><description><![CDATA[{e.get("summary_html","")}]]></description>
+<enclosure url="{x(e["url"])}" length="{e["bytes"]}" type="audio/mpeg"/><guid isPermaLink="false">{x(e["guid"])}</guid>
+<pubDate>{rfc(e["date"],e)}</pubDate><itunes:duration>{dur(e["seconds"])}</itunes:duration><itunes:episodeType>{e.get("type","full")}</itunes:episodeType>{extra}<itunes:explicit>false</itunes:explicit></item>''')
+xml=f'''<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd" xmlns:atom="http://www.w3.org/2005/Atom">
+<channel><title>{x(S["title"])}</title><link>{site}/</link><atom:link href="{site}/{S["slug"]}/feed.xml" rel="self" type="application/rss+xml"/>
+<description>{x(S["description"])}</description><language>en-us</language><itunes:author>Alder &amp; Pip</itunes:author>
+{owner}<itunes:image href="{site}/{S["slug"]}/cover.jpg"/><image><url>{site}/{S["slug"]}/cover.jpg</url><title>{x(S["title"])}</title><link>{site}/</link></image>
+<itunes:category text="Leisure"><itunes:category text="Video Games"/></itunes:category><itunes:explicit>false</itunes:explicit><itunes:type>episodic</itunes:type>
+{''.join(items)}
+</channel></rss>'''
+open(f'{d}/feed.xml','w').write(xml); print(len(items),'items')
